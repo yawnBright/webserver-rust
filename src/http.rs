@@ -3,11 +3,13 @@ use std::{collections::HashMap, vec};
 
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-enum Method {
+
+// 暂时只支持 get
+/* enum Method {
     GET,
     POST,
     UNKNOWN,
-}
+} */
 pub struct Request {
     start_line: Vec<String>,
     headers: HashMap<String, String>,
@@ -16,7 +18,7 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn get_method(&self) -> Method {
+    /* pub fn get_method(&self) -> Method {
         match self.start_line.get(0) {
             Some(m) => {
                 let m_lower = &m.to_lowercase();
@@ -33,7 +35,7 @@ impl Request {
                 return Method::UNKNOWN;
             }
         }
-    }
+    } */
     pub fn get_path(&self) -> Option<String> {
         match self.start_line.get(1) {
             Some(path) => return Some(path.to_string()),
@@ -78,268 +80,103 @@ impl Response {
     }
 }
 
+
+
+
 pub struct Parser {
     header_buf_size: usize,
     is_end: bool,
 }
 
+#[derive(Debug)]
 pub enum ParserErr {
     UnKnown,
     SockClose,
     NoEnd,
     DataLoss,
     ReadFail,
+    InvalidUtf8,
 }
 
+
+
 impl Parser {
-    pub fn new() -> Parser {
-        Parser {
+    pub fn new() -> Self {
+        Self {
             header_buf_size: 4096,
             is_end: false,
         }
     }
+
     pub fn set_buf_size(&mut self, bsz: usize) {
         self.header_buf_size = bsz;
     }
+
     pub fn is_end(&self) -> bool {
-        return self.is_end;
+        self.is_end
     }
     pub async fn parse(&mut self, stream: &mut TcpStream) -> Result<Request, ParserErr> {
-        let mut buf: Vec<u8> = Vec::with_capacity(self.header_buf_size);
-        /* if let Ok(num_read) = stream.read_buf(&mut buf).await {
-            if num_read == 0 {
-                self.is_end = true;
-            }
-        } else {
-            println!("{}:{} - 读取失败", file!(), line!());
-            return Err(ParserErr::ReadFail);
-        } */
-       match stream.read_buf(&mut buf).await {
-           Ok(n) => {
-            if n == 0 {
-                self.is_end = true;
-            }
-           },
-           Err(e) => {
-            self.is_end = true;
-            return Err(ParserErr::ReadFail);
-           }
-       }
+        let mut buf: Vec<u8> = vec![0; self.header_buf_size];
+        let num_read: usize = stream.read(&mut buf).await.map_err(|_| ParserErr::ReadFail)?;
 
-        match std::str::from_utf8(&buf) {
-            Ok(msg) => {
-                return Self::build_req(stream, msg, &buf).await;
-            }
-            Err(e) => {
-                println!("{}:{} - 转换utf-8失败", file!(), line!());
-                let valid_id = e.valid_up_to();
-                match std::str::from_utf8(&buf[..valid_id]) {
-                    Ok(msg) => {
-                        return Self::build_req(stream, msg, &buf).await;
-                    }
-                    Err(err) => {
-                        return Err(ParserErr::UnKnown);
-                    }
-                }
-            }
+        if num_read == 0 {
+            self.is_end = true;
+            return Err(ParserErr::SockClose);
         }
+
+        buf.truncate(num_read);
+        let msg = std::str::from_utf8(&buf).map_err(|_| ParserErr::InvalidUtf8)?;
+        
+        Self::build_req(stream, msg, &buf).await
     }
+
     async fn build_req(
         stream: &mut TcpStream,
         msg: &str,
-        buf: &Vec<u8>,
+        buf: &[u8],
     ) -> Result<Request, ParserErr> {
-        match msg.find("\r\n\r\n") {
-            None => {
-                println!("{}:{} - 找不到结束符", file!(), line!());
-                return Err(ParserErr::NoEnd);
-            }
+        let id_end = msg.find("\r\n\r\n").ok_or(ParserErr::NoEnd)?;
 
-            Some(id_end) => {
-                let mut request: Request = Request {
-                    start_line: vec![],
-                    headers: HashMap::new(),
-                    body: vec![],
-                };
-                let items: Vec<&str> = msg.split("\r\n").collect();
-                if let Some(&first_line) = items.first() {
-                    // 用空格分隔请求行
-                    request.start_line = first_line.split(" ").map(|tmp| tmp.to_string()).collect();
-                    if request.start_line.len() != 3 {
-                        return Err(ParserErr::UnKnown);
-                    }
-                } else {
-                    return Err(ParserErr::UnKnown);
-                }
-                for &item in items.iter().skip(1) {
-                    if item == "" {
-                        break;
-                    }
-                    match item.split_once(':') {
-                        Some((k, v)) => {
-                            request.headers.insert(k.to_string(), v.to_string());
-                        }
-                        None => {
-                            return Err(ParserErr::UnKnown);
-                        }
-                    }
-                }
-                match request.headers.get(&"Content-Length".to_string()) {
-                    Some(len) => match len.parse::<usize>() {
-                        Ok(len) => {
-                            request.body.extend_from_slice(&buf[(id_end + 4)..]);
-                            let res = len - request.body.len();
-                            if res > 0 {
-                                let mut buf_2: Vec<u8> = Vec::with_capacity(res);
-                                match stream.read_buf(&mut buf_2).await {
-                                    Ok(n) => {
-                                        if n < res {
-                                            return Err(ParserErr::DataLoss);
-                                        } else {
-                                            request.body.extend_from_slice(&buf_2);
-                                            return Ok(request);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        return Err(ParserErr::ReadFail);
-                                    }
-                                }
-                            } else {
-                                return Ok(request);
-                            }
-                        }
-                        Err(e) => {
-                            return Err(ParserErr::UnKnown);
-                        }
-                    },
-                    None => {
-                        request.body = Vec::with_capacity(0);
-                        // 解析成功 没有请求体
-                        return Ok(request);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/* impl Parser {
-    pub fn new() -> Parser{
-        Parser {
-            header_buf_size: 4096,
-        }
-    }
-    pub fn set_buf_size(&mut self, bsz: usize) {
-        self.header_buf_size = bsz;
-    }
-    pub async fn parse(&self, stream: &mut TcpStream) -> Result<Request, ParserErr> {
-        let mut buf: Vec<u8> = Vec::with_capacity(self.header_buf_size);
-        let num: usize = stream.read(&mut buf).await.unwrap();
-        if num <= 0 {
-            println!("{}:{} - socket closed", file!(), line!());
-            return Err(ParserErr::SockClose);
-        } else {
-            match std::str::from_utf8(&buf) {
-                Ok(msg) => {
-                    match msg.find("Content-Length:") {
-                        Some(id) => {
-                            match msg[id..].find("\r\n") {
-                                Some(id_e) => {
-                                    match msg[(id + "Content-Length:".len())..id_e].parse::<usize>() {
-                                        Ok(len) => {
-                                            return Err(ParserErr::NoEnd);
-                                        },
-                                        Err(e) => {
-                                            return Err(ParserErr::UnKnown);
-                                        },
-                                    }
-                                },
-                                None => {
-                                    return Err(ParserErr::UnKnown);
-                                },
-                            }
-                        },
-                        None => {
-                            match msg.find("\r\n\r\n") {
-                                Some(end) => {
-                                    return Ok(Self::build_request_only_header(&msg[..(end + 2)].to_string()));
-                                },
-                                None => {
-                                    return Err(ParserErr::NoEnd);
-                                },
-                            }
-                        },
-                    }
-                },
-                Err(e) => {
-                    let id: usize = e.valid_up_to();
-                    let head = String::from_utf8(buf[..id].to_vec()).unwrap();
-                    match head.find("Content-Length:") {
-                        Some(id) => {
-                            match head[id..].find("\r\n") {
-                                Some(id_e) => {
-                                    match head[(id + "Content-Length:".len())..id_e].parse::<usize>() {
-                                        Ok(len) => {
-                                            return Err(ParserErr::NoEnd);
-                                        },
-                                        Err(e) => {
-                                            return Err(ParserErr::UnKnown);
-                                        },
-                                    }
-                                },
-                                None => {
-                                    return Err(ParserErr::UnKnown);
-                                },
-                            }
-                        },
-                        None => {
-                            match head.find("\r\n\r\n") {
-                                Some(end) => {
-                                    return Ok(Self::build_request_only_header(&head[..(end + 2)].to_string()));
-                                },
-                                None => {
-                                    return Err(ParserErr::NoEnd);
-                                },
-                            }
-                        },
-                    }
-                },
-            }
-        }
-
-    }
-    fn build_request_only_header(h: &String) -> Request {
         let mut request = Request {
-            start_line: Vec::with_capacity(3),
+            start_line: vec![],
             headers: HashMap::new(),
-            body: Vec::with_capacity(0),
+            body: vec![],
         };
-        let items: Vec<&str> = h.split("\r\n").collect();
-        let mut flag: bool = true;
-        for item in items {
-            if flag {
-                let start_line: Vec<&str> = item.split(" ").collect();
-                let start_line: Vec<String> =
-                    start_line.into_iter().map(|s| s.to_string()).collect();
-                request.start_line = start_line;
-                flag = false;
-            } else {
-                if item.is_empty() == false {
-                    match item.find(":") {
-                        Some(id) => {
-                            request.headers.insert(
-                                item[..id].to_string(),
-                                item[(id + 1)..].to_string(),
-                            );
-                        }
-                        None => {
-                            println!("{}:{} - header解析出错", file!(), line!());
-                        }
-                    }
-                }
-            }
+
+        let mut lines = msg[..id_end].split("\r\n");
+
+        // Parse start line
+        let start_line = lines.next().ok_or(ParserErr::UnKnown)?;
+        request.start_line = start_line.split_whitespace().map(String::from).collect();
+        if request.start_line.len() != 3 {
+            return Err(ParserErr::UnKnown);
         }
-        return request;
+
+        // Parse headers
+        for line in lines {
+            let (key, value) = line.split_once(':').ok_or(ParserErr::UnKnown)?;
+            request.headers.insert(key.trim().to_string(), value.trim().to_string());
+        }
+
+        // Parse body
+        let body_start = id_end + 4;
+        let content_length: usize = request.headers
+            .get("Content-Length")
+            .and_then(|len| len.parse().ok())
+            .unwrap_or(0);
+
+        request.body.extend_from_slice(&buf[body_start..]);
+        let remaining = content_length.saturating_sub(request.body.len());
+
+        if remaining > 0 {
+            let mut additional_buf = vec![0; remaining];
+            let n = stream.read_exact(&mut additional_buf).await.map_err(|_| ParserErr::ReadFail)?;
+            if n < remaining {
+                return Err(ParserErr::DataLoss);
+            }
+            request.body.extend_from_slice(&additional_buf);
+        }
+
+        Ok(request)
     }
-}
- */
+} 

@@ -1,4 +1,5 @@
 use crate::{http, router};
+//use http::ParserErr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -37,7 +38,7 @@ impl Server {
 
     async fn client_handler(router: Arc<router::Router>, mut stream: TcpStream) {
         let mut parser = http::Parser::new();
-        // parser.set_buf_size(8192);
+        parser.set_buf_size(8192); // default 4096
         loop {
             if parser.is_end() {
                 println!("{}:{} - 关闭tcp", file!(), line!());
@@ -50,9 +51,11 @@ impl Server {
                         stream.write(&rps.as_bytes()).await.unwrap();
                     }
                     Err(e) => {
-                        println!("{}:{} - 请求解析失败", file!(), line!());
-                        if let http::ParserErr::UnKnown = e {
-                            println!("kk");
+                        match e {
+                            _ => {
+                                //println!("{}:{} - 发生错误: {:?}", file!(), line!(), e);
+                                break;
+                            },
                         }
                     }
                 }
